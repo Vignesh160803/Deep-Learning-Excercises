@@ -1,60 +1,82 @@
 import socket
-import time
-import os
-from subprocess import call
+import io
+from PIL import Image
+import google.generativeai as genai
 
-# Define the SSID and password of the ESP32-CAM access point
-ssid = "ESP32_CAM_AP"
-password = "12345678"
+# Ensure the API key is configured
+genai.configure(api_key="YOUR_API_KEY")
+model = genai.GenerativeModel('gemini-1.5-flash')
 
-# Define the folder where images will be saved
-save_folder = "/home/pi/captured_images"
+# Network settings
+server_ip = "192.168.4.2"  # Raspberry Pi IP address in ESP32's network
+server_port = 5000
 
-# Ensure the folder exists
-if not os.path.exists(save_folder):
-    os.makedirs(save_folder)
+# Create a server socket
+server_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+server_socket.bind((server_ip, server_port))
+server_socket.listen(1)
+print(f"Listening on {server_ip}:{server_port}")
 
-# Connect to the ESP32-CAM access point
-def connect_to_wifi():
-    print("Connecting to ESP32-CAM AP...")
-    call(["sudo", "nmcli", "d", "wifi", "connect", ssid, "password", password])
-    print("Connected to ESP32-CAM AP")
+class TrashClassificationModel:
+    def __init__(self):
+        self.input_prompt = """
+            You are an expert in identifying types of trash. 
+            You will receive an image as input, and your task is to classify it into one of the following categories: 
+            food, plastic, glass, metal, paper, organic, medical, nuclear waste. If it's not trash, return "Not Trash".
+            """
 
-def receive_image():
-    host = "192.168.4.1"  # ESP32-CAM's IP
-    port = 80
-    
+    def classify_image(self, uploaded_image):
+        # Convert the image to byte array for the API
+        img_byte_arr = io.BytesIO()
+        uploaded_image.save(img_byte_arr, format=uploaded_image.format)
+        img_byte_arr = img_byte_arr.getvalue()
+
+        # Send image to Gemini API
+        image_parts = [{"mime_type": "image/jpeg", "data": img_byte_arr}]
+        response = model.generate_content([image_parts[0], self.input_prompt])
+        return response.text
+
+def receive_image(client_socket):
+    # First, receive the image size
+    size_data = client_socket.recv(4)
+    image_size = int.from_bytes(size_data, byteorder='big')
+
+    # Then, receive the actual image data
+    image_data = b""
+    while len(image_data) < image_size:
+        chunk = client_socket.recv(1024)
+        if not chunk:
+            break
+        image_data += chunk
+
+    # Convert image data to PIL Image
+    img = Image.open(io.BytesIO(image_data))
+    return img
+
+def main():
+    trash_model = TrashClassificationModel()
+
     while True:
+        client_socket, addr = server_socket.accept()
+        print(f"Connection from {addr}")
+
         try:
-            # Create socket and connect to ESP32-CAM server
-            s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-            s.connect((host, port))
-            print("Connected to ESP32-CAM")
+            # Receive image from ESP32-CAM
+            image = receive_image(client_socket)
+            print("Image received")
 
-            # Receive image data
-            image_data = b""
-            while True:
-                chunk = s.recv(1024)
-                if not chunk:
-                    break
-                image_data += chunk
+            # Classify the image using Gemini API
+            classification_result = trash_model.classify_image(image)
+            print(f"Classification Result: {classification_result}")
 
-            # Save the image
-            timestamp = time.strftime("%Y%m%d-%H%M%S")
-            image_path = os.path.join(save_folder, f"image_{timestamp}.jpg")
-            with open(image_path, "wb") as f:
-                f.write(image_data)
-
-            print(f"Image saved as {image_path}")
-            s.close()
+            # Send the classification result back to ESP32-CAM
+            client_socket.sendall(classification_result.encode('utf-8'))
 
         except Exception as e:
             print(f"Error: {e}")
-            s.close()
 
-        # Wait for the next image (every 5 seconds)
-        time.sleep(5)
+        finally:
+            client_socket.close()
 
 if __name__ == "__main__":
-    connect_to_wifi()
-    receive_image()
+    main()
